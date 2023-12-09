@@ -10,7 +10,7 @@ from telegram import ReplyKeyboardMarkup
 import threading
 
 bot = telegram.Bot(token='6014113590:AAGlrJ_YwykcgAkCiROyXivqTSFeqPwZ8ZM')
-chat_id = '463825725'
+chat_ids = ['463825725', '274000220']
 
 def fetch_data_from_db():
     conn = sqlite3.connect('info.db')
@@ -104,6 +104,20 @@ def create_daily_info_table(connection):
     connection.commit()
     cursor.close()
 
+def create_archive_data_table(connection):
+    cursor = connection.cursor()
+    create_table_query = '''
+    CREATE TABLE IF NOT EXISTS archive_data (
+        token_symbol TEXT,
+        from_address TEXT,
+        count INTEGER,
+        buy_percent REAL,
+        sale_percent REAL
+    )'''
+    cursor.execute(create_table_query)
+    connection.commit()
+    cursor.close()
+
 def clear_sale_table(connection):
     cursor = connection.cursor()
     cursor.execute("DELETE FROM sale_token")
@@ -116,8 +130,15 @@ def clear_daily_table(connection):
     connection.commit()
     cursor.close()
 
+def clear_archive_table(connection):
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM archive_data")
+    connection.commit()
+    cursor.close()
+
 connection = create_db_connection()
 
+create_archive_data_table(connection)
 create_table(connection)
 create_sale_table(connection)
 create_daily_info_table(connection)
@@ -131,15 +152,55 @@ def clear_files():
 last_update_time = None
 data_processing_completed = False
 
-def safe_send_message(bot, chat_id, message):
-    max_length = 4096  # Максимальная длина сообщения в Telegram
+def update_archive_data(connection):
+    cursor = connection.cursor()
+    # Запрашиваем данные из buy_token
+    cursor.execute("SELECT * FROM buy_token")
+    data = cursor.fetchall()
 
-    while message:
-        # Отправляем часть сообщения и удаляем её из оригинальной строки
-        bot.send_message(chat_id, message[:max_length])
-        message = message[max_length:]
+    # Очищаем таблицу archive_data перед записью новых данных
+    cursor.execute("DELETE FROM archive_data")
+    connection.commit()
 
-def compare_and_send_new_tokens(bot, chat_id, connection):
+    # Вставляем данные из buy_token в archive_data
+    insert_query = '''
+    INSERT INTO archive_data (token_symbol, from_address, count, buy_percent)
+    VALUES (?, ?, ?, ?)'''
+    cursor.executemany(insert_query, data)
+    connection.commit()
+    cursor.close()
+
+def format_data_for_message(data):
+    if not data:
+        return "No data available."
+    message = ""
+    for row in data:
+        token_symbol, from_address, count, percent = row
+        percent_text = f"{percent:.2f}%" if percent is not None else "N/A"
+        line = f"Token Symbol: {token_symbol}, From: {from_address}, Count: {count}, Percent: {percent_text}\n"
+        message += line
+    return message if message else "No data available."
+
+def send_archive_data(update, context):
+    connection = create_db_connection()
+    cursor = connection.cursor()
+    cursor.execute("SELECT * FROM archive_data")
+    data = cursor.fetchall()
+    cursor.close()
+    connection.close()
+
+    message = format_data_for_message(data)
+    safe_send_message(bot, chat_ids, message)
+
+def safe_send_message(bot, chat_ids, message):
+    max_length = 4096
+    for chat_id in chat_ids:
+        temp_message = message
+        while temp_message:
+            bot.send_message(chat_id, temp_message[:max_length])
+            temp_message = temp_message[max_length:]
+
+def compare_and_send_new_tokens(bot, chat_ids, connection):
     cursor = connection.cursor()
 
     # Получаем токены из buy_token
@@ -154,14 +215,12 @@ def compare_and_send_new_tokens(bot, chat_id, connection):
     new_tokens = buy_tokens - daily_info_tokens
 
     if new_tokens:
-        message = "New tokens found:\n"
-        for token_symbol, from_address in new_tokens:
-            message += f"Token Symbol: {token_symbol}, From: {from_address}\n"
-
-        # Используем функцию безопасной отправки
-        safe_send_message(bot, chat_id, message)
+            message = "New tokens found:\n"
+            # ... формирование сообщения ...
+            safe_send_message(bot, chat_ids, message)  # обновленный вызов
     else:
-        bot.send_message(chat_id, "No new tokens found")
+        for chat_id in chat_ids:  # цикл для отправки каждому пользователю
+            bot.send_message(chat_id, "No new tokens found")
 
     cursor.close()
 
@@ -185,7 +244,7 @@ def copy_data_to_daily_info(connection):
 
     cursor.close()
 
-def send_data(bot, chat_id):
+def send_data(bot, chat_ids):
     data = fetch_data_from_db()
     message = ""
     for row in data:
@@ -202,15 +261,19 @@ def send_data(bot, chat_id):
         line = f"Token Symbol: {token_symbol}, Count: {count}, Percent: {buy_percent_text}{sale_percent_text}\n"
 
         if len(message) + len(line) > 4096:
-            bot.send_message(chat_id, message)
+            # Отправляем текущее сообщение всем пользователям и начинаем новое сообщение
+            for chat_id in chat_ids:
+                bot.send_message(chat_id, message)
             message = line
         else:
             message += line
 
     if message:
-        bot.send_message(chat_id, message)
+        for chat_id in chat_ids:
+            bot.send_message(chat_id, message)
     else:
-        bot.send_message(chat_id, "No data available")
+        for chat_id in chat_ids:
+            bot.send_message(chat_id, message)
 
 def check_if_data_already_inserted(connection):
     cursor = connection.cursor()
@@ -348,7 +411,9 @@ def start(update, context):
     
     keyboard = [
         [telegram.KeyboardButton("Send Processed Data")],
-        [telegram.KeyboardButton("Check New Tokens")]
+        [telegram.KeyboardButton("Check New Tokens")],
+        [telegram.KeyboardButton("Send Archive Data")],
+        [telegram.KeyboardButton("Compare Archive Data")]
     ]
 
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
@@ -363,8 +428,7 @@ def start(update, context):
 def data_button_handler(update, context):
     global data_processing_completed
     if data_processing_completed:
-        send_data(bot, chat_id)
-        data_processing_completed = True  # Сброс флага после отправки данных
+        send_data(bot, chat_ids)
     else:
         update.message.reply_text("Data processing is still in progress. Please wait.")
 
@@ -372,8 +436,7 @@ def button_handler(update, context):
     global data_processing_completed
 
     if data_processing_completed:
-        compare_and_send_new_tokens(bot, chat_id, create_db_connection())
-        data_processing_completed = True  # Сброс флага после отправки сообщения
+        compare_and_send_new_tokens(bot, chat_ids, create_db_connection())
     else:
         update.message.reply_text("Data processing is still in progress. Please wait.")
 
@@ -389,6 +452,8 @@ def main():
 
     dp.add_handler(MessageHandler(Filters.text("Send Processed Data") & ~Filters.command, data_button_handler))
     dp.add_handler(MessageHandler(Filters.text("Check New Tokens") & ~Filters.command, button_handler))
+    dp.add_handler(MessageHandler(Filters.text("Send Archive Data") & ~Filters.command, send_archive_data))
+    # dp.add_handler(MessageHandler(Filters.text("Compare Archive Data") & ~Filters.command, archive_data_comparison))
 
     # Запуск бота
     updater.start_polling()
@@ -401,6 +466,7 @@ def main_loop():
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     while True:
+        data_processing_completed = False
 
         connection = create_db_connection()
 
@@ -454,72 +520,20 @@ def main_loop():
             copy_data_to_daily_info(connection)
             last_update_time = current_time
 
+        data_processing_completed = True
+
+        if data_processing_completed:
+        # Обновляем данные в archive_data после каждого скана
+            update_archive_data(connection)
+
         end_time = time.time()
         print(f"Execution time: {end_time - start_time} seconds")
         connection.close()
 
-        data_processing_completed = True
+        for chat_id in chat_ids:
+            bot.send_message(chat_id, f"It is finish work script, Execution time: {end_time - start_time} seconds, Current time: {today}")
 
-        bot.send_message(chat_id, f"It is finish work script, Execution time: {end_time - start_time} seconds, Current time: {today}")
-
-        time.sleep(300)
+        time.sleep(10)
 
 if __name__ == '__main__':
     main()
-
-
-# while True:
-#     # Предварительно определенный список адресов
-#     wallet_addresses = [
-#     '0x84ccbf403370bbd060fe1f5ac88b5d5a44a2154f',
-#     '0xb022613d2b438df9b46ba426313d7bf69f49d9a2',
-#     '0xcf0d458ab8a54ef8d35b8b1b7713bfd8f412a9be',
-#     '0x09b0123bfdadb230511b256cf61176d339538c25',
-#     '0x0d7b8c6cb7cb9f16f5ec8d89472a504abb3df751',
-#     '0x13df64e9ec7b05d49812b6f1a1c28f7cfe213d24',
-#     ]
-
-
-#     start_time = time.time()
-
-#     api_keys = {
-#         'ethereum': 'KKJMDJBAZIXY1W379K2J89MFHHJRS1BP1B',
-#         'bnb': 'AHP8K2Q14MZFSH2VDXAYXY8U4ZP3RB3NI2',
-#         'arbitrum': 'E5RVS4B695DJ4GQZZK7Y2GWKEUBX5MWR8S',
-#         'polygon': 'HAPKBIMDF2CZCWQM2Y53PF9X43JSMBAXTM'
-#     }
-
-#     networks = ['ethereum', 'bnb', 'arbitrum', 'polygon']
-#     unique_sales = {}
-#     unique_tokens = {}
-
-#     for address in wallet_addresses:
-#         unique_sales[address] = set()
-#         unique_tokens[address] = set()
-#         for network in networks:
-#             # Проверяем валидность адреса перед обработкой
-#             if is_wallet_address_valid(address, network, api_keys):
-#                 get_latest_token_sales(api_keys, address, network, unique_sales)
-#                 get_latest_token_purchases(api_keys, address, network, unique_tokens)
-#             else:
-#                 print(f"Address {address} in network {network} is not valid. Skipping.")
-               
-#     clear_table(connection)
-#     clear_sale_table(connection)
-#     process_transactions(unique_tokens)
-#     analyze_data(wallet_addresses, connection)
-#     process_sales_transactions(unique_sales)
-#     analyze_sales_data(wallet_addresses, connection)
-
-#     current_time = time.time()
-#     if not last_update_time or current_time - last_update_time >= 86400:  # 86400 секунд в сутках
-#         copy_data_to_daily_info(connection)
-#         last_update_time = current_time
-
-#     if __name__ == '__main__':
-#         send_data(bot, chat_id)
-#         end_time = time.time()
-#         print(f"Execution time: {end_time - start_time} seconds")
-#         main()
-
-#     time.sleep(600)

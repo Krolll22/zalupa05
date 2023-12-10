@@ -111,8 +111,7 @@ def create_archive_data_table(connection):
         token_symbol TEXT,
         from_address TEXT,
         count INTEGER,
-        buy_percent REAL,
-        sale_percent REAL
+        buy_percent REAL
     )'''
     cursor.execute(create_table_query)
     connection.commit()
@@ -150,47 +149,55 @@ def clear_files():
     open('output_buy.txt', 'w').close()
 
 last_update_time = None
-data_processing_completed = False
 
-def update_archive_data(connection):
+def entry_archive_data(connection):
     cursor = connection.cursor()
-    # Запрашиваем данные из buy_token
+    # Получаем данные из buy_token
     cursor.execute("SELECT * FROM buy_token")
-    data = cursor.fetchall()
-
-    # Очищаем таблицу archive_data перед записью новых данных
-    cursor.execute("DELETE FROM archive_data")
-    connection.commit()
-
-    # Вставляем данные из buy_token в archive_data
-    insert_query = '''
-    INSERT INTO archive_data (token_symbol, from_address, count, buy_percent)
-    VALUES (?, ?, ?, ?)'''
-    cursor.executemany(insert_query, data)
-    connection.commit()
+    data_to_archive = cursor.fetchall()
+    
+    if data_to_archive:
+        # Очищаем таблицу archive_data и записываем новые данные
+        cursor.execute("DELETE FROM archive_data")
+        insert_query = "INSERT INTO archive_data (token_symbol, from_address, count, buy_percent) VALUES (?, ?, ?, ?)"
+        cursor.executemany(insert_query, data_to_archive)
+        connection.commit()
+        print("Data successfully archived.")
+    else:
+        print("No data to archive.")
+    
     cursor.close()
 
-def format_data_for_message(data):
-    if not data:
-        return "No data available."
+def format_archive_data_for_message(data):
+    messages = []
     message = ""
     for row in data:
-        token_symbol, from_address, count, percent = row
-        percent_text = f"{percent:.2f}%" if percent is not None else "N/A"
-        line = f"Token Symbol: {token_symbol}, From: {from_address}, Count: {count}, Percent: {percent_text}\n"
-        message += line
-    return message if message else "No data available."
+        token_symbol, count, buy_percent = row
+        line = f"Token Symbol: {token_symbol}, Count: {count}, Buy Percent: {buy_percent:.2f}%\n"
+        if len(message) + len(line) > 4000:
+            messages.append(message)
+            message = line
+        else:
+            message += line
+    if message:
+        messages.append(message)
+    return messages
 
-def send_archive_data(update, context):
-    connection = create_db_connection()
+def send_archive_data(connection, bot, chat_ids):
     cursor = connection.cursor()
-    cursor.execute("SELECT * FROM archive_data")
+    # Получаем данные из archive_data
+    cursor.execute("SELECT token_symbol, count, buy_percent FROM archive_data")
     data = cursor.fetchall()
     cursor.close()
-    connection.close()
 
-    message = format_data_for_message(data)
-    safe_send_message(bot, chat_ids, message)
+    if not data:
+        print("No archived data to send.")
+        return
+
+    # Форматируем данные для отправки
+    messages = format_archive_data_for_message(data)
+    for message in messages:
+        safe_send_message(bot, chat_ids, message)
 
 def safe_send_message(bot, chat_ids, message):
     max_length = 4096
@@ -425,6 +432,13 @@ def start(update, context):
     thread.start()
     update.message.reply_text("Bot started!")
 
+def send_archive_data_button_handler(update, context):
+    connection = create_db_connection()
+    try:
+        send_archive_data(connection, bot, chat_ids)
+    finally:
+        connection.close()
+
 def data_button_handler(update, context):
     global data_processing_completed
     if data_processing_completed:
@@ -452,7 +466,7 @@ def main():
 
     dp.add_handler(MessageHandler(Filters.text("Send Processed Data") & ~Filters.command, data_button_handler))
     dp.add_handler(MessageHandler(Filters.text("Check New Tokens") & ~Filters.command, button_handler))
-    dp.add_handler(MessageHandler(Filters.text("Send Archive Data") & ~Filters.command, send_archive_data))
+    dp.add_handler(MessageHandler(Filters.text("Send Archive Data") & ~Filters.command, send_archive_data_button_handler))
     # dp.add_handler(MessageHandler(Filters.text("Compare Archive Data") & ~Filters.command, archive_data_comparison))
 
     # Запуск бота
@@ -475,13 +489,8 @@ def main_loop():
 
         # Предварительно определенный список адресов
         wallet_addresses = [
-        '0x84ccbf403370bbd060fe1f5ac88b5d5a44a2154f',
-        '0xb022613d2b438df9b46ba426313d7bf69f49d9a2',
-        '0xcf0d458ab8a54ef8d35b8b1b7713bfd8f412a9be',
-        '0x09b0123bfdadb230511b256cf61176d339538c25',
-        '0x0d7b8c6cb7cb9f16f5ec8d89472a504abb3df751',
-        '0x13df64e9ec7b05d49812b6f1a1c28f7cfe213d24',
-        '0x13e80af6e25bc608864b3a589c2e6c93f9415912',
+'0xc8ddb827c3f11e8fe36e717ef84cc9a9d36f6672',
+'0xee9b0b28c25743718484f54bbe2d2eb4d8e1c607',
         ]
 
         start_time = time.time()
@@ -523,8 +532,7 @@ def main_loop():
         data_processing_completed = True
 
         if data_processing_completed:
-        # Обновляем данные в archive_data после каждого скана
-            update_archive_data(connection)
+            entry_archive_data(connection)
 
         end_time = time.time()
         print(f"Execution time: {end_time - start_time} seconds")

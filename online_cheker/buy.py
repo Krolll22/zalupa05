@@ -8,8 +8,14 @@ from datetime import datetime, timedelta, timezone
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 from telegram import ReplyKeyboardMarkup
 import threading
+from telegram import Bot
+from telegram.utils.request import Request
 
-bot = telegram.Bot(token='6014113590:AAGlrJ_YwykcgAkCiROyXivqTSFeqPwZ8ZM')
+data_processing_completed = False
+
+request = Request(connect_timeout=300.0, read_timeout=300.0)
+bot = Bot(token='6014113590:AAGlrJ_YwykcgAkCiROyXivqTSFeqPwZ8ZM', request=request)
+
 chat_ids = ['463825725', '274000220']
 
 def fetch_data_from_db():
@@ -150,6 +156,43 @@ def clear_files():
 
 last_update_time = None
 
+def compare_archive_data(connection):
+    cursor = connection.cursor()
+    # Получаем данные из archive_data
+    cursor.execute("SELECT token_symbol, from_address, count FROM archive_data")
+    archive_data = cursor.fetchall()
+    
+    # Получаем данные из daily_info
+    cursor.execute("SELECT token_symbol, from_address FROM daily_info")
+    daily_info_data = cursor.fetchall()
+
+    # Преобразуем данные из daily_info в set для ускорения поиска
+    daily_info_set = { (token_symbol, from_address) for token_symbol, from_address in daily_info_data }
+
+    # Формируем список токенов, которые есть в archive_data, но нет в daily_info
+    new_tokens = [row for row in archive_data if (row[0], row[1]) not in daily_info_set]
+
+    cursor.close()
+    return new_tokens
+
+def send_compare_archive_data(bot, chat_ids, connection):
+    data_to_send = compare_archive_data(connection)
+    if not data_to_send:
+        for chat_id in chat_ids:
+            bot.send_message(chat_id, "No data avalible")
+        return
+
+    messages = format_archive_data_for_message(data_to_send)
+    for message in messages:
+        safe_send_message(bot, chat_ids, message)
+
+def button_handler_archive_data(update, context):
+    connection = create_db_connection()
+    try:
+        send_compare_archive_data(context.bot, chat_ids, connection)
+    finally:
+        connection.close()
+
 def entry_archive_data(connection):
     cursor = connection.cursor()
     # Получаем данные из buy_token
@@ -171,9 +214,8 @@ def entry_archive_data(connection):
 def format_archive_data_for_message(data):
     messages = []
     message = ""
-    for row in data:
-        token_symbol, count, buy_percent = row
-        line = f"Token Symbol: {token_symbol}, Count: {count}, Buy Percent: {buy_percent:.2f}%\n"
+    for token_symbol, from_address, count in data:
+        line = f"Token Symbol: {token_symbol}, From: {from_address}, Count: {count}\n"
         if len(message) + len(line) > 4000:
             messages.append(message)
             message = line
@@ -207,29 +249,42 @@ def safe_send_message(bot, chat_ids, message):
             bot.send_message(chat_id, temp_message[:max_length])
             temp_message = temp_message[max_length:]
 
-def compare_and_send_new_tokens(bot, chat_ids, connection):
+def compare_data(connection):
     cursor = connection.cursor()
-
-    # Получаем токены из buy_token
-    cursor.execute("SELECT token_symbol, from_address FROM buy_token")
-    buy_tokens = set(cursor.fetchall())
-
-    # Получаем токены из daily_info
+    cursor.execute("SELECT * FROM buy_token")
+    buy_token_data = cursor.fetchall()
+    
     cursor.execute("SELECT token_symbol, from_address FROM daily_info")
-    daily_info_tokens = set(cursor.fetchall())
-
-    # Находим новые токены, которые есть в buy_token, но нет в daily_info
-    new_tokens = buy_tokens - daily_info_tokens
-
-    if new_tokens:
-            message = "New tokens found:\n"
-            # ... формирование сообщения ...
-            safe_send_message(bot, chat_ids, message)  # обновленный вызов
-    else:
-        for chat_id in chat_ids:  # цикл для отправки каждому пользователю
-            bot.send_message(chat_id, "No new tokens found")
-
+    daily_info_data = cursor.fetchall()
+    
+    daily_info_set = set(tuple(i[:2]) for i in daily_info_data)  # Consider only token_symbol and from_address
+    
+    # Find entries in buy_token not in daily_info
+    result = [data for data in buy_token_data if (data[0], data[1]) not in daily_info_set]
     cursor.close()
+    return result
+
+def format_messages(differences):
+    message = ""
+    messages = []
+    for diff in differences:
+        line = f"Token Symbol: {diff[0]}, From Address: {diff[1]}, Count: {diff[2]}, Percent: {diff[3]}\n"
+        if len(message) + len(line) > 4000:
+            messages.append(message)
+            message = line
+        else:
+            message += line
+    if message:  # Add any remaining message text
+        messages.append(message)
+    return messages
+
+def send_compare_data(bot, chat_ids, connection):
+    differences = compare_data(connection)
+    messages = format_messages(differences)
+    
+    for message in messages:
+        for chat_id in chat_ids:
+            bot.send_message(chat_id=chat_id, text=message)
 
 def copy_data_to_daily_info(connection):
     cursor = connection.cursor()
@@ -357,7 +412,7 @@ def analyze_sales_data(wallet_addresses, connection):
 
     for (token_symbol, to_address), count in token_to_counts.items():
         percentage = (count / wallet_addresses_count) * 100
-        if 6 < percentage <= 90:  # Можно изменить процентные значения в соответствии с вашими критериями
+        if 3 < percentage <= 25:  # Можно изменить процентные значения в соответствии с вашими критериями
             insert_into_sale_token(connection, token_symbol, to_address, count, percentage)
 
 def get_latest_token_purchases(api_keys, address, network, unique_tokens):
@@ -411,7 +466,7 @@ def analyze_data(wallet_addresses, connection):
     # Анализ и запись результатов
     for (token_symbol, from_address), count in token_from_counts.items():
         percentage = (count / wallet_addresses_count) * 100
-        if 6 < percentage <= 90:
+        if 3 < percentage <= 25:
             insert_into_buy_token(connection, token_symbol, from_address, count, percentage)
 
 def start(update, context):
@@ -441,6 +496,7 @@ def send_archive_data_button_handler(update, context):
 
 def data_button_handler(update, context):
     global data_processing_completed
+
     if data_processing_completed:
         send_data(bot, chat_ids)
     else:
@@ -450,7 +506,7 @@ def button_handler(update, context):
     global data_processing_completed
 
     if data_processing_completed:
-        compare_and_send_new_tokens(bot, chat_ids, create_db_connection())
+        send_compare_data(bot, chat_ids, create_db_connection())
     else:
         update.message.reply_text("Data processing is still in progress. Please wait.")
 
@@ -467,7 +523,7 @@ def main():
     dp.add_handler(MessageHandler(Filters.text("Send Processed Data") & ~Filters.command, data_button_handler))
     dp.add_handler(MessageHandler(Filters.text("Check New Tokens") & ~Filters.command, button_handler))
     dp.add_handler(MessageHandler(Filters.text("Send Archive Data") & ~Filters.command, send_archive_data_button_handler))
-    # dp.add_handler(MessageHandler(Filters.text("Compare Archive Data") & ~Filters.command, archive_data_comparison))
+    dp.add_handler(MessageHandler(Filters.text("Compare Archive Data") & ~Filters.command, button_handler_archive_data))
 
     # Запуск бота
     updater.start_polling()
@@ -489,8 +545,13 @@ def main_loop():
 
         # Предварительно определенный список адресов
         wallet_addresses = [
-'0xc8ddb827c3f11e8fe36e717ef84cc9a9d36f6672',
-'0xee9b0b28c25743718484f54bbe2d2eb4d8e1c607',
+'0x95374a34a55143b9c5b57efeeeda6e39843fbab9',
+'0xbaf8dfe5ccc428ed35d1c51d3f45ee5d566e445a',
+'0xa2c04c13ede1e6b514c301e0fb02e23a01df331c',
+'0xc517c84b82a9a74419bba85faac584b3e7adb705',
+'0xcfd0ab22fc62e2c166c57197dfeb488715ea77e9',
+'0x3b563f592c88a37fdc97c63e3287e916cd6918a4',
+'0xe50c4588b3135ae73cfe7faed0bda17ef1f911aa',
         ]
 
         start_time = time.time()
@@ -541,7 +602,7 @@ def main_loop():
         for chat_id in chat_ids:
             bot.send_message(chat_id, f"It is finish work script, Execution time: {end_time - start_time} seconds, Current time: {today}")
 
-        time.sleep(10)
+        time.sleep(120)
 
 if __name__ == '__main__':
     main()
